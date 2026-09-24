@@ -93,52 +93,107 @@ export const useBoardStore = defineStore('board', () => {
     })
   }
 
+  // --- Single source of truth helpers ---
+  // The server is authoritative: every mutation is reconciled against its
+  // response (or refetched when the outcome is unknown), so the list,
+  // column counts and reopened card can never drift from what was written.
+
+  function findCard(cardId) {
+    for (const colId in cards.value) {
+      const found = cards.value[colId].find(c => c.id === cardId)
+      if (found) return found
+    }
+    return null
+  }
+
+  // Place a card exactly where the server says it is, removing any stale
+  // copy left in another column.
+  function upsertCard(serverCard) {
+    for (const colId in cards.value) {
+      cards.value[colId] = cards.value[colId].filter(c => c.id !== serverCard.id)
+    }
+    if (!cards.value[serverCard.column_id]) cards.value[serverCard.column_id] = []
+    const list = cards.value[serverCard.column_id]
+    const pos = Math.max(0, Math.min(serverCard.position ?? list.length, list.length))
+    list.splice(pos, 0, serverCard)
+  }
+
+  // A response means the server accepted or rejected the request for sure.
+  // No response (network/timeout) is ambiguous: the write may have landed,
+  // so resync from the server before surfacing the error.
+  async function resyncOnAmbiguous(err) {
+    if (!err.response) {
+      try { await fetchAllCards() } catch (_) { /* keep original error */ }
+    }
+    throw err
+  }
+
   async function addCard(columnId, data) {
-    const res = await cardApi.create(columnId, data)
-    if (!cards.value[columnId]) cards.value[columnId] = []
-    cards.value[columnId].push(res.data)
-    return res.data
+    try {
+      const res = await cardApi.create(columnId, data)
+      if (!cards.value[columnId]) cards.value[columnId] = []
+      cards.value[columnId].push(res.data)
+      return res.data
+    } catch (err) {
+      if (!err.response) {
+        // Request may have succeeded despite the lost response. Resync and
+        // recover the card if it actually made it to the server.
+        try { await fetchAllCards() } catch (_) { /* fall through */ }
+        const title = (data.title || '').trim()
+        const recovered = (cards.value[columnId] || [])
+          .slice()
+          .reverse()
+          .find(c => c.title === title)
+        if (recovered) return recovered
+      }
+      throw err
+    }
   }
 
   async function updateCard(cardId, data) {
-    const res = await cardApi.update(cardId, data)
-    // Update card in the local state
-    for (const colId in cards.value) {
-      const idx = cards.value[colId].findIndex(c => c.id === cardId)
-      if (idx !== -1) {
-        cards.value[colId][idx] = res.data
-        break
+    try {
+      const res = await cardApi.update(cardId, data)
+      upsertCard(res.data)
+      // A move rewrites positions in two columns; refetch so order/counts match.
+      if (data.columnId !== undefined && data.columnId !== null) {
+        try { await fetchAllCards() } catch (_) { /* res.data is already applied */ }
       }
+      return res.data
+    } catch (err) {
+      return resyncOnAmbiguous(err)
     }
-    return res.data
   }
 
   async function deleteCard(cardId) {
-    await cardApi.delete(cardId)
-    for (const colId in cards.value) {
-      cards.value[colId] = cards.value[colId].filter(c => c.id !== cardId)
+    try {
+      await cardApi.delete(cardId)
+      for (const colId in cards.value) {
+        cards.value[colId] = cards.value[colId].filter(c => c.id !== cardId)
+      }
+    } catch (err) {
+      if (!err.response) {
+        try { await fetchAllCards() } catch (_) { /* fall through */ }
+        // Delete may have landed despite the lost response.
+        if (!findCard(cardId)) return
+      }
+      throw err
     }
   }
 
   async function moveCard(cardId, targetColumnId, position) {
-    const res = await cardApi.move(cardId, targetColumnId, position)
-    // Remove card from old column and add to new column
-    let movedCard = null
-    for (const colId in cards.value) {
-      const idx = cards.value[colId].findIndex(c => c.id === cardId)
-      if (idx !== -1) {
-        movedCard = cards.value[colId].splice(idx, 1)[0]
-        break
-      }
+    try {
+      const res = await cardApi.move(cardId, targetColumnId, position)
+      upsertCard(res.data)
+      // Refetch to align positions in both affected columns.
+      try { await fetchAllCards() } catch (_) { /* res.data is already applied */ }
+      return res.data
+    } catch (err) {
+      // A definitive rejection (e.g. target column gone) must snap the
+      // optimistically dragged card back; an ambiguous failure must adopt
+      // whatever the server actually wrote. Either way resync.
+      try { await fetchAllCards() } catch (_) { /* surface original error */ }
+      throw err
     }
-    if (movedCard) {
-      movedCard.column_id = targetColumnId
-      movedCard.position = position
-      if (!cards.value[targetColumnId]) cards.value[targetColumnId] = []
-      // Insert at position
-      cards.value[targetColumnId].splice(position, 0, movedCard)
-    }
-    return res.data
   }
 
   function clearBoard() {
@@ -151,7 +206,7 @@ export const useBoardStore = defineStore('board', () => {
     boards, currentBoard, columns, cards, loading,
     fetchBoards, createBoard, deleteBoard,
     fetchColumns, addColumn, renameColumn, deleteColumn, reorderColumn,
-    fetchCards, fetchAllCards, addCard, updateCard, deleteCard, moveCard,
+    fetchCards, fetchAllCards, addCard, updateCard, deleteCard, moveCard, findCard,
     clearBoard
   }
 })

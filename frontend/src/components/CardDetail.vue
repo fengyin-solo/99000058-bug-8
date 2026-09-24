@@ -51,14 +51,14 @@
     </el-form>
 
     <template #footer>
-      <el-button @click="$emit('update:visible', false)">Cancel</el-button>
+      <el-button :disabled="saving" @click="$emit('update:visible', false)">Cancel</el-button>
       <el-button type="primary" :loading="saving" @click="handleSave">Save Changes</el-button>
     </template>
   </el-dialog>
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useBoardStore } from '../stores/board.js'
 
@@ -68,7 +68,7 @@ const props = defineProps({
   allColumns: { type: Array, default: () => [] }
 })
 
-const emit = defineEmits(['update:visible', 'updated', 'move'])
+const emit = defineEmits(['update:visible', 'updated'])
 
 const boardStore = useBoardStore()
 const formRef = ref(null)
@@ -99,30 +99,49 @@ function initForm() {
 }
 
 async function handleSave() {
+  if (saving.value) return
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
 
   saving.value = true
+  // Field edit and column move go in a single atomic request so a failure
+  // can never leave "content saved but move failed" (or vice versa).
+  const payload = {
+    title: form.value.title,
+    description: form.value.description,
+    priority: form.value.priority,
+    due_date: form.value.due_date || null
+  }
+  if (moveTarget.value && moveTarget.value !== props.card.column_id) {
+    payload.columnId = moveTarget.value
+    payload.position = 0
+  }
+
   try {
-    const updated = await boardStore.updateCard(props.card.id, {
-      title: form.value.title,
-      description: form.value.description,
-      priority: form.value.priority,
-      due_date: form.value.due_date || null
-    })
+    const updated = await boardStore.updateCard(props.card.id, payload)
     emit('updated', updated)
-    ElMessage.success('Card updated')
-
-    // Handle move if target column selected
-    if (moveTarget.value && moveTarget.value !== props.card.column_id) {
-      await boardStore.moveCard(props.card.id, moveTarget.value, 0)
-      ElMessage.success('Card moved')
-    }
-
+    ElMessage.success(moveTarget.value ? 'Card updated and moved' : 'Card updated')
+    moveTarget.value = null
     emit('update:visible', false)
   } catch (err) {
-    ElMessage.error('Failed to update card')
+    // Keep the dialog open with the typed content and selected column so the
+    // user can retry. If the request was lost after the server applied it,
+    // the store already resynced; detect that and finish the save normally.
+    const serverCard = boardStore.findCard(props.card.id)
+    const wantedColumn = payload.columnId ?? props.card.column_id
+    const landed = serverCard
+      && serverCard.column_id === wantedColumn
+      && serverCard.title === form.value.title.trim()
+    if (landed) {
+      emit('updated', { ...serverCard })
+      ElMessage.success(payload.columnId ? 'Card updated and moved' : 'Card updated')
+      moveTarget.value = null
+      emit('update:visible', false)
+      return
+    }
+    if (serverCard) emit('updated', { ...serverCard })
+    ElMessage.error(err.response?.data?.error || 'Failed to save card. Please try again.')
   } finally {
     saving.value = false
   }

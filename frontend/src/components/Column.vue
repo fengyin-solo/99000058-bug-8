@@ -1,5 +1,5 @@
 <template>
-  <div class="column">
+  <div class="column" :data-column-id="column.id">
     <div class="column-header">
       <div v-if="!isEditing" class="column-title" @dblclick="startEditing">
         <h3>{{ column.name }}</h3>
@@ -59,7 +59,6 @@ import { ref, nextTick } from 'vue'
 import { MoreFilled, Plus } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import TaskCard from './TaskCard.vue'
-import { cardApi } from '../api/index.js'
 
 const props = defineProps({
   column: { type: Object, required: true },
@@ -97,25 +96,20 @@ function handleCommand(command) {
 }
 
 async function onCardDragEnd(evt) {
-  const cardId = evt.item?.__draggable_context?.element?.id
-  const toColumnId = props.column.id
-  
-  // Find source column
-  const fromContext = evt.from.__draggable_context
-  const toContext = evt.to.__draggable_context
-  
+  const dragged = evt.item?.__draggable_context?.element
+  const cardId = dragged?.id
   if (!cardId) return
-  
+
+  const toColumnEl = evt.to.closest('[data-column-id]')
+  const toColumnId = Number(toColumnEl?.dataset.columnId)
   const newIndex = evt.newIndex
-  
-  // If moved to a different column, update via API
-  if (evt.from !== evt.to) {
-    try {
-      await cardApi.move(cardId, toColumnId, newIndex)
-    } catch (err) {
-      // Refresh would be needed here, but the store handles it
-    }
-  }
+  if (!toColumnId) return
+
+  const fromColumnId = Number(evt.from.closest('[data-column-id]')?.dataset.columnId)
+  // Route every drag (including same-column reorders) through the store so
+  // positions are persisted and the lists/counts stay reconciled with the
+  // server. The store resyncs on failure, snapping the UI back if rejected.
+  emit('move-card', cardId, toColumnId, newIndex, fromColumnId)
 }
 </script>
 

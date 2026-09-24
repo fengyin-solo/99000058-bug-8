@@ -17,13 +17,50 @@ function getCardWithOwnership(db, cardId, userId) {
   `).get(cardId);
 }
 
-function verifyColumnOwnership(db, columnId, userId) {
+// Verify a target column belongs to the same board as the card.
+function findTargetColumn(db, columnId, boardId) {
   return db.prepare(`
-    SELECT col.*, b.user_id 
-    FROM columns col 
-    JOIN boards b ON col.board_id = b.id 
-    WHERE col.id = ?
-  `).get(columnId, userId);
+    SELECT col.*, b.user_id FROM columns col
+    JOIN boards b ON col.board_id = b.id
+    WHERE col.id = ? AND col.board_id = ?
+  `).get(columnId, boardId);
+}
+
+// Shift positions and move a card. Must run inside a transaction so a
+// failure never leaves columns half-shifted.
+function moveCardInTransaction(db, card, targetColumnId, position) {
+  const oldColumnId = card.column_id;
+  const oldPosition = card.position;
+
+  if (oldColumnId === targetColumnId && position === oldPosition) {
+    return oldPosition;
+  }
+
+  // Remove card from its old position, compacting the source column first.
+  // This makes the math identical for same-column reorders and cross-column moves.
+  db.prepare(`
+    UPDATE cards SET position = position - 1
+    WHERE column_id = ? AND position > ?
+  `).run(oldColumnId, oldPosition);
+
+  // Max position in the target column *with the card removed* from the source.
+  const maxPosRow = db.prepare('SELECT MAX(position) AS maxPos FROM cards WHERE column_id = ?').get(targetColumnId);
+  let newPosition = position !== undefined ? position : (maxPosRow.maxPos ?? -1) + 1;
+  newPosition = Math.max(0, Math.min(newPosition, (maxPosRow.maxPos ?? -1) + 1));
+
+  // Make room in target column.
+  db.prepare(`
+    UPDATE cards SET position = position + 1
+    WHERE column_id = ? AND position >= ?
+  `).run(targetColumnId, newPosition);
+
+  // Move the card.
+  db.prepare(`
+    UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now')
+    WHERE id = ?
+  `).run(targetColumnId, newPosition, card.id);
+
+  return newPosition;
 }
 
 // GET /api/columns/:columnId/cards - Get cards in column
@@ -100,9 +137,9 @@ router.post('/columns/:columnId/cards', (req, res) => {
   }
 });
 
-// PUT /api/cards/:id - Update card
+// PUT /api/cards/:id - Update card (fields and/or column move, atomically)
 router.put('/cards/:id', (req, res) => {
-  const { title, description, priority, due_date } = req.body;
+  const { title, description, priority, due_date, columnId, position } = req.body;
   const db = getDb();
 
   try {
@@ -112,20 +149,37 @@ router.put('/cards/:id', (req, res) => {
       return res.status(404).json({ error: 'Card not found' });
     }
 
-    const updates = [];
-    const params = [];
-
-    if (title !== undefined) { updates.push('title = ?'); params.push(title.trim()); }
-    if (description !== undefined) { updates.push('description = ?'); params.push(description); }
-    if (priority !== undefined) { updates.push('priority = ?'); params.push(priority); }
-    if (due_date !== undefined) { updates.push('due_date = ?'); params.push(due_date || null); }
-
-    updates.push("updated_at = datetime('now')");
-
-    if (updates.length > 0) {
-      params.push(req.params.id);
-      db.prepare(`UPDATE cards SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    let targetColumnId = card.column_id;
+    if (columnId !== undefined && columnId !== null) {
+      const targetCol = findTargetColumn(db, columnId, card.board_id);
+      if (!targetCol || targetCol.user_id !== req.user.id) {
+        db.close();
+        return res.status(404).json({ error: 'Target column not found in this board' });
+      }
+      targetColumnId = columnId;
     }
+
+    const updateCard = db.transaction(() => {
+      const updates = [];
+      const params = [];
+
+      if (title !== undefined) { updates.push('title = ?'); params.push(title.trim()); }
+      if (description !== undefined) { updates.push('description = ?'); params.push(description); }
+      if (priority !== undefined) { updates.push('priority = ?'); params.push(priority); }
+      if (due_date !== undefined) { updates.push('due_date = ?'); params.push(due_date || null); }
+
+      if (columnId !== undefined && columnId !== null) {
+        moveCardInTransaction(db, card, targetColumnId, position);
+      }
+
+      if (updates.length > 0) {
+        updates.push("updated_at = datetime('now')");
+        params.push(req.params.id);
+        db.prepare(`UPDATE cards SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+      }
+    });
+
+    updateCard();
 
     const updated = db.prepare('SELECT * FROM cards WHERE id = ?').get(req.params.id);
     db.close();
@@ -178,41 +232,15 @@ router.put('/cards/:id/move', (req, res) => {
     }
 
     // Verify target column belongs to same board and user
-    const targetCol = db.prepare(`
-      SELECT col.*, b.user_id FROM columns col 
-      JOIN boards b ON col.board_id = b.id 
-      WHERE col.id = ? AND col.board_id = ?
-    `).get(columnId, card.board_id);
-
+    const targetCol = findTargetColumn(db, columnId, card.board_id);
     if (!targetCol || targetCol.user_id !== req.user.id) {
       db.close();
       return res.status(404).json({ error: 'Target column not found in this board' });
     }
 
-    const oldColumnId = card.column_id;
-    const oldPosition = card.position;
-
-    // Get max position in target column
-    const maxPos = db.prepare('SELECT MAX(position) AS maxPos FROM cards WHERE column_id = ?').get(columnId);
-    const newPosition = position !== undefined ? Math.min(position, (maxPos.maxPos ?? -1) + 1) : (maxPos.maxPos ?? -1) + 1;
-
-    // Remove card from old position (shift cards down in old column)
-    db.prepare(`
-      UPDATE cards SET position = position - 1 
-      WHERE column_id = ? AND position > ?
-    `).run(oldColumnId, oldPosition);
-
-    // Make room in target column (shift cards up in target column)
-    db.prepare(`
-      UPDATE cards SET position = position + 1 
-      WHERE column_id = ? AND position >= ?
-    `).run(columnId, newPosition);
-
-    // Move the card
-    db.prepare(`
-      UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now') 
-      WHERE id = ?
-    `).run(columnId, newPosition, req.params.id);
+    db.transaction(() => {
+      moveCardInTransaction(db, card, columnId, position);
+    })();
 
     const updated = db.prepare('SELECT * FROM cards WHERE id = ?').get(req.params.id);
     db.close();

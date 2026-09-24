@@ -68,7 +68,6 @@
       :card="selectedCard"
       :all-columns="boardStore.columns"
       @updated="onCardUpdated"
-      @move="handleMoveCard"
     />
   </div>
 </template>
@@ -167,12 +166,14 @@ async function confirmDeleteCard(card) {
   }
 }
 
-async function handleMoveCard(cardId, targetColumnId, position) {
+async function handleMoveCard(cardId, targetColumnId, position, fromColumnId) {
   try {
     await boardStore.moveCard(cardId, targetColumnId, position)
-    ElMessage.success('Card moved')
+    if (fromColumnId !== undefined && fromColumnId !== targetColumnId) {
+      ElMessage.success('Card moved')
+    }
   } catch (err) {
-    ElMessage.error('Failed to move card')
+    ElMessage.error(err.response?.data?.error || 'Failed to move card')
   }
 }
 
