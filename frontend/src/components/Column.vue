@@ -36,6 +36,7 @@
       >
         <template #item="{ element: card }">
           <TaskCard
+            :data-card-id="card.id"
             :card="card"
             :all-columns="allColumns"
             @edit="$emit('edit-card', card)"
@@ -59,7 +60,9 @@ import { ref, nextTick } from 'vue'
 import { MoreFilled, Plus } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import TaskCard from './TaskCard.vue'
-import { cardApi } from '../api/index.js'
+import { useBoardStore } from '../stores/board.js'
+
+const boardStore = useBoardStore()
 
 const props = defineProps({
   column: { type: Object, required: true },
@@ -97,24 +100,26 @@ function handleCommand(command) {
 }
 
 async function onCardDragEnd(evt) {
-  const cardId = evt.item?.__draggable_context?.element?.id
-  const toColumnId = props.column.id
-  
-  // Find source column
-  const fromContext = evt.from.__draggable_context
-  const toContext = evt.to.__draggable_context
-  
-  if (!cardId) return
-  
+  // vuedraggable (SortableJS) provides the dragged DOM node and the
+  // destination index. The card id is stored on the rendered element.
+  const cardId = evt.item?.dataset?.cardId != null
+    ? Number(evt.item.dataset.cardId)
+    : null
+  if (cardId == null) return
+
+  const sameColumn = evt.from === evt.to
+  const movedWithin = sameColumn && evt.oldIndex === evt.newIndex
+  if (movedWithin) return
+
   const newIndex = evt.newIndex
-  
-  // If moved to a different column, update via API
-  if (evt.from !== evt.to) {
-    try {
-      await cardApi.move(cardId, toColumnId, newIndex)
-    } catch (err) {
-      // Refresh would be needed here, but the store handles it
-    }
+  // Go through the store: it calls the API and then reconciles every column
+  // from the server state, so on failure the cards snap back and counts
+  // always match the database. No 'move-card' emit here to avoid a duplicate
+  // toast; menu-triggered moves still go through the parent handler.
+  try {
+    await boardStore.moveCard(cardId, props.column.id, newIndex)
+  } catch (err) {
+    // store already re-synced on failure
   }
 }
 </script>

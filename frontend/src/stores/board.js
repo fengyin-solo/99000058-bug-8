@@ -93,52 +93,60 @@ export const useBoardStore = defineStore('board', () => {
     })
   }
 
+  // Insert or update a card coming from the server at its authoritative position.
+  // The store is always reconciled to server data, never guessed locally.
+  function upsertCard(serverCard) {
+    if (!serverCard || serverCard.id == null) return
+    // Remove any stale copy first (e.g. card that changed columns)
+    removeCardLocally(serverCard.id)
+    const colId = serverCard.column_id
+    if (!cards.value[colId]) cards.value[colId] = []
+    const list = cards.value[colId]
+    const pos = Number.isInteger(serverCard.position) ? serverCard.position : list.length
+    list.splice(Math.min(Math.max(pos, 0), list.length), 0, serverCard)
+  }
+
+  function removeCardLocally(cardId) {
+    for (const colId in cards.value) {
+      cards.value[colId] = cards.value[colId].filter(c => c.id !== cardId)
+    }
+  }
+
   async function addCard(columnId, data) {
     const res = await cardApi.create(columnId, data)
-    if (!cards.value[columnId]) cards.value[columnId] = []
-    cards.value[columnId].push(res.data)
+    upsertCard(res.data)
     return res.data
   }
 
   async function updateCard(cardId, data) {
+    // Server may apply field changes and/or an atomic move (columnId/position)
     const res = await cardApi.update(cardId, data)
-    // Update card in the local state
-    for (const colId in cards.value) {
-      const idx = cards.value[colId].findIndex(c => c.id === cardId)
-      if (idx !== -1) {
-        cards.value[colId][idx] = res.data
-        break
-      }
+    if (data.columnId != null && currentBoard.value) {
+      // A move reshuffles positions of other cards too; re-sync to stay exact
+      await fetchAllCards(currentBoard.value.id).catch(() => upsertCard(res.data))
+    } else {
+      upsertCard(res.data)
     }
     return res.data
   }
 
   async function deleteCard(cardId) {
     await cardApi.delete(cardId)
-    for (const colId in cards.value) {
-      cards.value[colId] = cards.value[colId].filter(c => c.id !== cardId)
-    }
+    removeCardLocally(cardId)
   }
 
   async function moveCard(cardId, targetColumnId, position) {
-    const res = await cardApi.move(cardId, targetColumnId, position)
-    // Remove card from old column and add to new column
-    let movedCard = null
-    for (const colId in cards.value) {
-      const idx = cards.value[colId].findIndex(c => c.id === cardId)
-      if (idx !== -1) {
-        movedCard = cards.value[colId].splice(idx, 1)[0]
-        break
+    try {
+      await cardApi.move(cardId, targetColumnId, position)
+    } finally {
+      // Whether the request succeeded or failed (it may have been applied on
+      // the server but the response was lost), reconcile to authoritative
+      // server state so lists, counts and positions can never drift, and a
+      // retry is always idempotent.
+      if (currentBoard.value) {
+        await fetchAllCards(currentBoard.value.id).catch(() => {})
       }
     }
-    if (movedCard) {
-      movedCard.column_id = targetColumnId
-      movedCard.position = position
-      if (!cards.value[targetColumnId]) cards.value[targetColumnId] = []
-      // Insert at position
-      cards.value[targetColumnId].splice(position, 0, movedCard)
-    }
-    return res.data
   }
 
   function clearBoard() {

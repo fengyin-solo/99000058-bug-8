@@ -99,30 +99,35 @@ function initForm() {
 }
 
 async function handleSave() {
-  if (!formRef.value) return
-  const valid = await formRef.value.validate().catch(() => false)
-  if (!valid) return
-
+  if (saving.value) return // guard against double clicks
   saving.value = true
   try {
-    const updated = await boardStore.updateCard(props.card.id, {
+    if (!formRef.value) return
+    const valid = await formRef.value.validate().catch(() => false)
+    if (!valid) return
+
+    const payload = {
       title: form.value.title,
       description: form.value.description,
       priority: form.value.priority,
       due_date: form.value.due_date || null
-    })
-    emit('updated', updated)
-    ElMessage.success('Card updated')
-
-    // Handle move if target column selected
+    }
+    // Move together with the field update: the server applies both atomically,
+    // so there is no "fields saved but move failed" half-state.
     if (moveTarget.value && moveTarget.value !== props.card.column_id) {
-      await boardStore.moveCard(props.card.id, moveTarget.value, 0)
-      ElMessage.success('Card moved')
+      payload.columnId = moveTarget.value
+      payload.position = 0
     }
 
+    const updated = await boardStore.updateCard(props.card.id, payload)
+    emit('updated', updated)
     emit('update:visible', false)
+    ElMessage.success(payload.columnId != null ? 'Card updated and moved' : 'Card updated')
   } catch (err) {
-    ElMessage.error('Failed to update card')
+    // Dialog stays open and form values are retained so the user can retry.
+    // Nothing is optimistically changed locally; the list already matches
+    // whatever the server actually persisted.
+    ElMessage.error(err.response?.data?.error || 'Failed to save card. Please try again.')
   } finally {
     saving.value = false
   }

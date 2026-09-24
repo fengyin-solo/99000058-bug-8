@@ -82,12 +82,13 @@ function resetForm() {
 }
 
 async function handleAdd() {
-  if (!formRef.value) return
-  const valid = await formRef.value.validate().catch(() => false)
-  if (!valid) return
-
+  if (adding.value) return // guard against double clicks
   adding.value = true
   try {
+    if (!formRef.value) return
+    const valid = await formRef.value.validate().catch(() => false)
+    if (!valid) return
+
     await boardStore.addCard(props.columnId, {
       title: form.value.title,
       description: form.value.description,
@@ -98,7 +99,8 @@ async function handleAdd() {
     emit('update:visible', false)
     emit('added')
   } catch (err) {
-    ElMessage.error(err.response?.data?.error || 'Failed to add card')
+    // Keep the dialog and entered values so the user can retry safely.
+    ElMessage.error(err.response?.data?.error || 'Failed to add card. Please try again.')
   } finally {
     adding.value = false
   }

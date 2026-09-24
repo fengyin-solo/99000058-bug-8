@@ -100,31 +100,135 @@ router.post('/columns/:columnId/cards', (req, res) => {
   }
 });
 
-// PUT /api/cards/:id - Update card
+// Shared card-loading/ownership helper
+function loadOwnedCard(db, cardId, userId) {
+  const card = getCardWithOwnership(db, cardId, userId);
+  if (!card || card.user_id !== userId) return null;
+  return card;
+}
+
+// Apply field updates (title/description/priority/due_date) to a bound statement runner
+function applyFieldUpdates(db, cardId, body) {
+  const { title, description, priority, due_date } = body;
+  const updates = [];
+  const params = [];
+
+  if (title !== undefined) { updates.push('title = ?'); params.push(title.trim()); }
+  if (description !== undefined) { updates.push('description = ?'); params.push(description); }
+  if (priority !== undefined) { updates.push('priority = ?'); params.push(priority); }
+  if (due_date !== undefined) { updates.push('due_date = ?'); params.push(due_date || null); }
+
+  if (updates.length > 0) {
+    updates.push("updated_at = datetime('now')");
+    params.push(cardId);
+    db.prepare(`UPDATE cards SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  }
+}
+
+// Move a card within/across columns. Throws HttpError on validation failure
+// so the surrounding better-sqlite3 transaction rolls back atomically.
+// Must run inside a transaction so the position reshuffle is atomic.
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+function moveCardInTransaction(db, card, targetColumnId, position) {
+  // Verify target column belongs to the same board (and therefore the same user)
+  const targetCol = db.prepare(`
+    SELECT col.*, b.user_id FROM columns col
+    JOIN boards b ON col.board_id = b.id
+    WHERE col.id = ? AND col.board_id = ?
+  `).get(targetColumnId, card.board_id)
+
+  if (!targetCol || targetCol.user_id !== card.user_id) {
+    throw new HttpError(404, 'Target column not found in this board')
+  }
+
+  const oldColumnId = card.column_id;
+  const oldPosition = card.position;
+
+  const maxPos = db.prepare('SELECT MAX(position) AS maxPos FROM cards WHERE column_id = ?').get(targetColumnId);
+  const newPosition = position !== undefined
+    ? Math.min(Math.max(position, 0), (maxPos.maxPos ?? -1) + 1)
+    : (maxPos.maxPos ?? -1) + 1;
+
+  if (oldColumnId === targetColumnId && oldPosition === newPosition) {
+    return
+  }
+
+  if (oldColumnId === targetColumnId) {
+    // Reorder within the same column
+    if (newPosition > oldPosition) {
+      db.prepare(`
+        UPDATE cards SET position = position - 1
+        WHERE column_id = ? AND position > ? AND position <= ?
+      `).run(oldColumnId, oldPosition, newPosition);
+    } else {
+      db.prepare(`
+        UPDATE cards SET position = position + 1
+        WHERE column_id = ? AND position >= ? AND position < ?
+      `).run(oldColumnId, newPosition, oldPosition);
+    }
+  } else {
+    // Shift cards down in the old column, make room in the new one
+    db.prepare(`
+      UPDATE cards SET position = position - 1
+      WHERE column_id = ? AND position > ?
+    `).run(oldColumnId, oldPosition);
+
+    db.prepare(`
+      UPDATE cards SET position = position + 1
+      WHERE column_id = ? AND position >= ?
+    `).run(targetColumnId, newPosition);
+  }
+
+  db.prepare(`
+    UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now')
+    WHERE id = ?
+  `).run(targetColumnId, newPosition, card.id)
+}
+
+// PUT /api/cards/:id - Update card fields (optionally move it as well, atomically)
 router.put('/cards/:id', (req, res) => {
-  const { title, description, priority, due_date } = req.body;
+  const { title, description, priority, due_date, columnId, position } = req.body;
   const db = getDb();
 
   try {
-    const card = getCardWithOwnership(db, req.params.id, req.user.id);
-    if (!card || card.user_id !== req.user.id) {
+    const card = loadOwnedCard(db, req.params.id, req.user.id);
+    if (!card) {
       db.close();
       return res.status(404).json({ error: 'Card not found' });
     }
 
-    const updates = [];
-    const params = [];
-
-    if (title !== undefined) { updates.push('title = ?'); params.push(title.trim()); }
-    if (description !== undefined) { updates.push('description = ?'); params.push(description); }
-    if (priority !== undefined) { updates.push('priority = ?'); params.push(priority); }
-    if (due_date !== undefined) { updates.push('due_date = ?'); params.push(due_date || null); }
-
-    updates.push("updated_at = datetime('now')");
-
-    if (updates.length > 0) {
-      params.push(req.params.id);
-      db.prepare(`UPDATE cards SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    if (columnId !== undefined && columnId !== null) {
+      // Field updates + move must either both succeed or both fail.
+      // A thrown HttpError (e.g. bad target column) rolls back the whole txn,
+      // so a failed move can never leave edited fields half-applied.
+      const moveTxn = db.transaction(() => {
+        applyFieldUpdates(db, card.id, req.body)
+        const fresh = db.prepare(`
+          SELECT c.*, col.board_id, b.user_id
+          FROM cards c
+          JOIN columns col ON c.column_id = col.id
+          JOIN boards b ON col.board_id = b.id
+          WHERE c.id = ?
+        `).get(card.id)
+        moveCardInTransaction(db, fresh, columnId, position)
+      })
+      try {
+        moveTxn()
+      } catch (txErr) {
+        db.close()
+        if (txErr instanceof HttpError) {
+          return res.status(txErr.status).json({ error: txErr.message })
+        }
+        throw txErr
+      }
+    } else {
+      applyFieldUpdates(db, card.id, req.body)
     }
 
     const updated = db.prepare('SELECT * FROM cards WHERE id = ?').get(req.params.id);
@@ -162,7 +266,7 @@ router.delete('/cards/:id', (req, res) => {
   }
 });
 
-// PUT /api/cards/:id/move - Move card to another column
+// PUT /api/cards/:id/move - Move card to another column / reorder
 router.put('/cards/:id/move', (req, res) => {
   const { columnId, position } = req.body;
   if (!columnId) {
@@ -171,48 +275,21 @@ router.put('/cards/:id/move', (req, res) => {
 
   const db = getDb();
   try {
-    const card = getCardWithOwnership(db, req.params.id, req.user.id);
-    if (!card || card.user_id !== req.user.id) {
+    const card = loadOwnedCard(db, req.params.id, req.user.id);
+    if (!card) {
       db.close();
       return res.status(404).json({ error: 'Card not found' });
     }
 
-    // Verify target column belongs to same board and user
-    const targetCol = db.prepare(`
-      SELECT col.*, b.user_id FROM columns col 
-      JOIN boards b ON col.board_id = b.id 
-      WHERE col.id = ? AND col.board_id = ?
-    `).get(columnId, card.board_id);
-
-    if (!targetCol || targetCol.user_id !== req.user.id) {
-      db.close();
-      return res.status(404).json({ error: 'Target column not found in this board' });
+    try {
+      db.transaction(() => moveCardInTransaction(db, card, columnId, position))()
+    } catch (txErr) {
+      db.close()
+      if (txErr instanceof HttpError) {
+        return res.status(txErr.status).json({ error: txErr.message })
+      }
+      return res.status(500).json({ error: 'Failed to move card' })
     }
-
-    const oldColumnId = card.column_id;
-    const oldPosition = card.position;
-
-    // Get max position in target column
-    const maxPos = db.prepare('SELECT MAX(position) AS maxPos FROM cards WHERE column_id = ?').get(columnId);
-    const newPosition = position !== undefined ? Math.min(position, (maxPos.maxPos ?? -1) + 1) : (maxPos.maxPos ?? -1) + 1;
-
-    // Remove card from old position (shift cards down in old column)
-    db.prepare(`
-      UPDATE cards SET position = position - 1 
-      WHERE column_id = ? AND position > ?
-    `).run(oldColumnId, oldPosition);
-
-    // Make room in target column (shift cards up in target column)
-    db.prepare(`
-      UPDATE cards SET position = position + 1 
-      WHERE column_id = ? AND position >= ?
-    `).run(columnId, newPosition);
-
-    // Move the card
-    db.prepare(`
-      UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now') 
-      WHERE id = ?
-    `).run(columnId, newPosition, req.params.id);
 
     const updated = db.prepare('SELECT * FROM cards WHERE id = ?').get(req.params.id);
     db.close();

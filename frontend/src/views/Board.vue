@@ -144,8 +144,19 @@ function onCardAdded() {
   showAddCard.value = false
 }
 
+function findCard(cardId) {
+  for (const colId in boardStore.cards) {
+    const found = boardStore.cards[colId].find(c => c.id === cardId)
+    if (found) return found
+  }
+  return null
+}
+
 function openCardDetail(card) {
-  selectedCard.value = { ...card }
+  // Always open from the reconciled store so content AND column are current,
+  // even if the list element handed in is a stale drag snapshot.
+  const live = findCard(card.id) || card
+  selectedCard.value = { ...live }
   showCardDetail.value = true
 }
 
@@ -172,7 +183,8 @@ async function handleMoveCard(cardId, targetColumnId, position) {
     await boardStore.moveCard(cardId, targetColumnId, position)
     ElMessage.success('Card moved')
   } catch (err) {
-    ElMessage.error('Failed to move card')
+    // store.moveCard already reconciled the board; keep the message accurate
+    ElMessage.error(err.response?.data?.error || 'Failed to move card. Please try again.')
   }
 }
 
